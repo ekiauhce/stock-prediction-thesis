@@ -149,7 +149,10 @@ def _fetch_one(
 
 
 def fetch_data():
-	rows = _fetch(["SBER", "GAZP"], dt.date(2023, 1, 1), dt.datetime(2023, 10, 1), Interval.HOUR)
+	rows = _fetch([
+		"SBER",
+		# "GAZP"
+	], dt.date(2023, 1, 1), dt.datetime(2023, 10, 1), Interval.HOUR)
 	with open("data.jsonl", "w+") as f:
 		for row in rows:
 			json.dump(row, f, ensure_ascii=False, default=str)
@@ -180,7 +183,7 @@ def get_arrays(df: pandas.DataFrame):
 	target_field = 'close'
 	x = df.drop([target_field], axis="columns")
 	y = df[target_field]
-	extracted_features = get_features(x, from_file=True)
+	extracted_features = get_features(x, from_file=False)
 
 	return (extracted_features, y)
 
@@ -194,17 +197,19 @@ def train(df: pandas.DataFrame):
 	x, y = get_arrays(df)
 	x_train, x_test, y_train, y_test = train_test_split(x, y, test_size=1/6, shuffle=False)
 
+	y_test = y_test.reset_index(drop=True)
 	logging.info(f"y real:\n{y_test}")
 
 	# ??? The dual coefficients or intercepts are not finite. The input data may contain large values and need to be preprocessed.
 	# model = SVR(kernel="poly", C=100, gamma="auto", degree=3, epsilon=0.1, coef0=1)
 	model = LinearRegression()
+	logging.info("Executing model.fit ")
 	model.fit(x_train, y_train)
 	y_predicted = model.predict(x_test)
 	logging.info(f"y predicted:\n{y_predicted}")
 
 	plt.plot(y_predicted, label = "y predicted")
-	plt.plot(y_test, label = " y real")
+	plt.plot(y_test.values, label = "y real")
 	plt.legend()
 	plt.show()
 
