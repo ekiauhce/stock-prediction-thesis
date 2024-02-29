@@ -5,11 +5,14 @@ import json
 import logging
 import time
 from typing import List
+import warnings
 import requests
 from threading import Thread
 
 import datetime as dt
-import pandas
+import pandas as pd
+import matplotlib.pyplot as plt
+import numpy as np
 
 logging.basicConfig(
 	level=logging.INFO,
@@ -39,42 +42,18 @@ with open("./tickers.json", "r") as f:
 	tickers = json.load(f)
 
 def _convert(row):
+	if "date" not in row:
+		print(row)
 	date = dt.datetime.strptime(row["date"], "%Y%m%d")
 	time = dt.datetime.strptime(row["time"], "%H%M%S").time()
 	return {
-		"ticker": row["ticker"],
+		"datetime": dt.datetime.combine(date, time),
 		"open": float(row["open"]),
 		"close": float(row["close"]),
 		"high": float(row["high"]),
 		"low": float(row["low"]),
 		"vol": float(row["vol"]),
-		"datetime": dt.datetime.combine(date, time)
 	}
-
-
-def _fetch(
-	tickers: List[str],
-	start_date: dt.date,
-	end_date: dt.date,
-	interval: Interval = Interval.DAY,
-	price_at: PriceAt = PriceAt.OPEN
-) -> List[dict]:
-	threads: List[Thread] = []
-	results = []
-	def target(*args):
-		r = _fetch_one(*args)
-		results.append(r)
-	for ticker in tickers:
-		thread = Thread(target=target, args=(ticker, start_date, end_date, interval, price_at))
-		threads.append(thread)
-	for t in threads:
-		t.start()
-		t.join()
-	# TODO: try spoofing user agent / ip to bypass req limiter:
-	# "Система уже обрабатывает Ваш запрос. Дождитесь окончания обработки."
-	# [t.start() for t in threads]
-	# [t.join() for t in threads]
-	return [row for result in results for row in result]
 
 def _fetch_one(
 	ticker: str,
@@ -148,21 +127,48 @@ def _fetch_one(
 	return [_convert(dict(zip(row_fields, line))) for line in reader]
 
 
-def fetch_data():
-	rows = _fetch([
-		"SBER",
-		# "GAZP"
-	], dt.date(2023, 1, 1), dt.datetime(2023, 10, 1), Interval.HOUR)
-	with open("data.jsonl", "w+") as f:
-		for row in rows:
-			json.dump(row, f, ensure_ascii=False, default=str)
-			f.write("\n")
+def get_date_chunks(start_date: dt.date, end_date: dt.date, delta: dt.timedelta):
+	result = []
+	left = start_date
+	while left < end_date:
+		right = left + delta
+		right = min(right, end_date)
+		result.append((left, right))
+		left = right + dt.timedelta(days=1)
+	return result
+
+
+def get_file_name(ticker, name):
+	return f"data-{ticker.lower()}-{name}.jsonl"
+
+def fetch_data(tickers: list[str]):
+	intervals = [
+		(Interval.MIN_1, "minutely", dt.timedelta(weeks=4)),
+		(Interval.DAY, "daily", dt.timedelta(weeks=4)),
+	]
+	for interval, name, delta in intervals:
+		chunks = get_date_chunks(
+			dt.date(2014, 1, 1),
+			dt.date(2024, 1, 1),
+			delta
+		)
+		for t in tickers:
+			file_name = get_file_name(t, name)
+			with open(file_name, "w+") as f:
+				for e in chunks:
+					logging.info(f"Fetching ticker {t}, interval {name}, chunk {e}")
+					rows = _fetch_one(t, *e, interval)
+					for row in rows:
+						json.dump(row, f, ensure_ascii=False, default=str)
+						f.write("\n")
+			logging.info(f"Done fetching ticker {t} for interval {name}, file {file_name} is ready")
+
 
 def get_features(x, from_file):
 	import tsfresh
 	from tsfresh.utilities.dataframe_functions import impute
 	if from_file:
-		extracted_features = pandas.read_pickle("features.pickle", compression="zstd")
+		extracted_features = pd.read_pickle("features.pickle", compression="zstd")
 		logging.info("Loaded tsfresh features from file")
 	else:
 		extracted_features = tsfresh.extract_features(
@@ -179,7 +185,7 @@ def get_features(x, from_file):
 	logging.info(f"Extracted features:\n{extracted_features}\n{extracted_features.dtypes}")
 	return extracted_features
 
-def get_arrays(df: pandas.DataFrame):
+def get_arrays(df: pd.DataFrame):
 	target_field = 'close'
 	x = df.drop([target_field], axis="columns")
 	y = df[target_field]
@@ -188,7 +194,7 @@ def get_arrays(df: pandas.DataFrame):
 	return (extracted_features, y)
 
 
-def train(df: pandas.DataFrame):
+def train(df: pd.DataFrame):
 	from sklearn.svm import SVR
 	from sklearn.model_selection import train_test_split
 	from sklearn.linear_model import LinearRegression
@@ -213,20 +219,73 @@ def train(df: pandas.DataFrame):
 	plt.legend()
 	plt.show()
 
-def main():
-	# fetch_data()
 
-	df = pandas.read_json("data.jsonl", lines=True)
-	df = df.sort_values(["datetime", "ticker"], ascending=[True, True])
-	df = df.reset_index(drop=True)
-	# ???
-	# numpy.core._exceptions._UFuncBinaryResolutionError: ufunc 'add' cannot use operands with types dtype('<M8[ns]') and dtype('<M8[ns]')
-	df = df.drop(["datetime"], axis="columns")
-	df["id"] = df.index + 1
-	df["ticker_id"] = df["ticker"].apply(lambda x: tickers[x])
-	df = df.drop(["ticker"], axis="columns")
-	logging.info(f"Dataset:\n{df}\n{df.dtypes}")
-	train(df)
+def explore_target(ticker: str):
+	df = pd.read_json(get_file_name(ticker, "daily"), lines=True)
+
+	df = df.sort_values(["datetime"], ascending=[True])
+	df = df.drop_duplicates(subset=['datetime'])
+	df.set_index('datetime', inplace=True)
+	df = df.asfreq('d')
+	df = df.interpolate()
+
+	window_sizes = [dt.timedelta(days=i) for i in range(1, 57)]
+	for w in window_sizes:
+		days = w.days
+		indexer = pd.api.indexers.FixedForwardWindowIndexer(window_size=days)
+		df[f'max_over_{days}'] = df['high'].rolling(window=indexer).max()
+		df[f'min_over_{days}'] = df['low'].rolling(window=indexer).min()
+		for p in ('max', 'min'):
+			# TODO: open?
+			df[f'{p}_pct_change_over_{days}'] = (df[f'{p}_over_{days}'] - df['open']) / df['open']
+
+
+	names = [f'{p}_pct_change_over_{w.days}' for w in window_sizes for p in ('max', 'min')]
+
+	TRADING_DAYS = dt.timedelta(weeks=12).days
+	scaled_mean_column = f'mean_scaled_to_{TRADING_DAYS}'
+	desc = df[names].describe()
+	desc = desc.transpose()
+	desc['days'] = desc.index.str.extract('(\d+)', expand=False).astype(int)
+	desc[scaled_mean_column] = desc['mean'] * TRADING_DAYS / desc['days']
+
+	group_by_days = desc.groupby("days", group_keys=True)[[scaled_mean_column]].sum()
+	return (group_by_days.index, group_by_days[scaled_mean_column])
+
+
+def main():
+	warnings.filterwarnings("ignore")
+	tickers = [
+		"SBER",
+		"GAZP",
+		"PIKK",
+		"VTBR",
+		"MVID"
+	]
+	# fetch_data(tickers)
+	plt.figure()
+	for ticker in tickers:
+		x, y = explore_target(ticker)
+		plt.plot(x, y, label=ticker)
+	plt.xlabel("Window size, days")
+	plt.ylabel("Sum of max and min scaled means, pct")
+	plt.legend()
+	plt.grid()
+	plt.show()
+
+	# print(df.head(50).drop(['close', 'low', 'vol'], axis=1))
+
+
+
+	# df = df.reset_index(drop=True)
+	# # ???
+	# # numpy.core._exceptions._UFuncBinaryResolutionError: ufunc 'add' cannot use operands with types dtype('<M8[ns]') and dtype('<M8[ns]')
+	# df = df.drop(["datetime"], axis="columns")
+	# df["id"] = df.index + 1
+	# df["ticker_id"] = df["ticker"].apply(lambda x: tickers[x])
+	# df = df.drop(["ticker"], axis="columns")
+	# logging.info(f"Dataset:\n{df}\n{df.dtypes}")
+	# train(df)
 
 if __name__ == "__main__":
 	main()
